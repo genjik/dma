@@ -1,5 +1,6 @@
 #include <string.h>
 #include <stdio.h>
+#include <stdint.h>
 
 /* The standard allocator interface from stdlib.h.  These are the
  * functions you must implement, more information on each function is
@@ -9,6 +10,7 @@ void *malloc(size_t size);
 void free(void *ptr);
 void *calloc(size_t nmemb, size_t size);
 void *realloc(void *ptr, size_t size);
+void *sbrk(intptr_t increment);
 
 /* When requesting memory from the OS using sbrk(), request it in
  * increments of CHUNK_SIZE. */
@@ -55,12 +57,70 @@ static inline __attribute__((unused)) int block_index(size_t x) {
     }
 }
 
+// Initializes multi-pool allocator's free list.
+// Keep in mind that indexes [0, 4] inclusive should remain NULL at all time
+// For now, init requires using sbrk(CHUNK_SIZE=4096), but the data structure
+// only needs 104/4096 bytes. Any memory address after 103 should not be used.
+static intptr_t** free_list = NULL;
+static int init_heap() {
+	free_list = sbrk(CHUNK_SIZE);
+	if (sbrk == (void*) -1) { return -1; }
+
+	for (int i = 0; i <= 12; i++) {
+		*(free_list + i) = NULL;
+	}
+	
+	return 0;
+}
+
 /*
  * You must implement malloc().  Your implementation of malloc() must be
  * the multi-pool allocator described in the project handout.
  */
 void *malloc(size_t size) {
-    return bulk_alloc(size);
+	if (size == 0) { return NULL; }
+
+	if (free_list == NULL) {
+		int ret_val = init_heap();
+		if (ret_val == -1) { return NULL; }
+	}
+
+	if (size > 4088) {
+		void* addr = bulk_alloc(size + sizeof(size_t));	
+
+		if (addr == NULL) { 
+			return NULL; 
+		}
+
+		*(size_t *) addr = size + sizeof(size_t);
+		return addr + sizeof(size_t);
+	}
+
+	int i = block_index(size);
+
+	if (*(free_list + i) == NULL) {
+		void *new_addr = sbrk(CHUNK_SIZE);	
+		if (new_addr == (void *) -1) {
+			return NULL;
+		}
+
+		size_t size_of_block = 1 << i;
+		for (int j = 0; j < CHUNK_SIZE; j += size_of_block) {
+			*(size_t *) (new_addr + j) = size_of_block;
+			if (j == CHUNK_SIZE - size_of_block) {
+				*(intptr_t **) (new_addr + j + sizeof(size_t)) = NULL;
+			} else {
+				*(intptr_t **) (new_addr + j + sizeof(size_t)) = new_addr + (j * 2);	
+			}
+		}
+
+		*(free_list + i) = new_addr + size_of_block;
+		return new_addr + sizeof(size_t);
+	} else {
+		void *block = *(free_list + i);
+		*(free_list + i) = block + sizeof(size_t);
+		return block + sizeof(size_t);
+	}
 }
 
 /*
@@ -105,5 +165,16 @@ void *realloc(void *ptr, size_t size) {
  * The given implementation does nothing.
  */
 void free(void *ptr) {
-    return;
+	if (ptr == NULL) { return; }
+
+	size_t size_of_block = *(size_t *) (ptr - sizeof(size_t));
+
+	if (size_of_block > CHUNK_SIZE) {
+		bulk_free(ptr - sizeof(size_t), size_of_block);
+	} else {
+		int i = size_of_block - __builtin_clz(size_of_block) - 1;				
+		if (free_list != NULL) {
+			*(intptr_t *) ptr = *(free_list + i);
+		}
+	}
 }
