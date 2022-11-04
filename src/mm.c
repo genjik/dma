@@ -1,6 +1,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <unistd.h>
 
 /* The standard allocator interface from stdlib.h.  These are the
  * functions you must implement, more information on each function is
@@ -10,7 +11,8 @@ void *malloc(size_t size);
 void free(void *ptr);
 void *calloc(size_t nmemb, size_t size);
 void *realloc(void *ptr, size_t size);
-void *sbrk(intptr_t increment);
+
+void free_list_validator();
 
 /* When requesting memory from the OS using sbrk(), request it in
  * increments of CHUNK_SIZE. */
@@ -61,13 +63,17 @@ static inline __attribute__((unused)) int block_index(size_t x) {
 // Keep in mind that indexes [0, 4] inclusive should remain NULL at all time
 // For now, init requires using sbrk(CHUNK_SIZE=4096), but the data structure
 // only needs 104/4096 bytes. Any memory address after 103 should not be used.
-static intptr_t** free_list = NULL;
+static void *free_list = NULL;
+
 static int init_heap() {
 	free_list = sbrk(CHUNK_SIZE);
-	if (sbrk == (void*) -1) { return -1; }
+	if (sbrk == (void*) -1) { 
+		return -1;
+	}
 
-	for (int i = 0; i <= 12; i++) {
-		*(free_list + i) = NULL;
+	for (int i = 0; i < 512; i++) {
+		void *curr_addr = free_list + (i * sizeof(uintptr_t));
+		*(uintptr_t *) curr_addr = 0;
 	}
 	
 	return 0;
@@ -78,27 +84,36 @@ static int init_heap() {
  * the multi-pool allocator described in the project handout.
  */
 void *malloc(size_t size) {
-	if (size == 0) { return NULL; }
-
-	if (free_list == NULL) {
-		int ret_val = init_heap();
-		if (ret_val == -1) { return NULL; }
+	if (size <= 0) { 
+		return NULL; 
 	}
 
-	if (size > 4088) {
-		void* addr = bulk_alloc(size + sizeof(size_t));	
+	// Check if free_list is initialized. If it isn't, initialize it.
+	if (free_list == NULL) {
+		int error = init_heap();
+		if (error == -1) { 
+			return NULL; 
+		}
+	}
+
+	// Use bulk_alloc for size > 4088
+	if (size > CHUNK_SIZE - sizeof(uintptr_t)) {
+		size_t total_size = size + sizeof(uintptr_t);
+		void *addr = bulk_alloc(total_size);	
 
 		if (addr == NULL) { 
 			return NULL; 
 		}
 
-		*(size_t *) addr = size + sizeof(size_t);
-		return addr + sizeof(size_t);
+		*(uintptr_t *) addr = total_size;
+		return addr + sizeof(uintptr_t);
 	}
 
-	int i = block_index(size);
+	size_t i = block_index(size);
+	size_t offset = i * sizeof(uintptr_t);
+	void *ptr_to_list = free_list + offset;
 
-	if (*(free_list + i) == NULL) {
+	if (*(uintptr_t **) ptr_to_list == NULL) {
 		void *new_addr = sbrk(CHUNK_SIZE);	
 		if (new_addr == (void *) -1) {
 			return NULL;
@@ -106,20 +121,25 @@ void *malloc(size_t size) {
 
 		size_t size_of_block = 1 << i;
 		for (int j = 0; j < CHUNK_SIZE; j += size_of_block) {
-			*(size_t *) (new_addr + j) = size_of_block;
+			void *curr_addr = new_addr + j;
+			*(uintptr_t *) curr_addr = size_of_block;
+
+			void *adj_addr = curr_addr + sizeof(uintptr_t);
 			if (j == CHUNK_SIZE - size_of_block) {
-				*(intptr_t **) (new_addr + j + sizeof(size_t)) = NULL;
+				*(uintptr_t *) adj_addr = 0;
 			} else {
-				*(intptr_t **) (new_addr + j + sizeof(size_t)) = new_addr + (j * 2);	
+				*(uintptr_t **) adj_addr = curr_addr + size_of_block;
 			}
 		}
 
-		*(free_list + i) = new_addr + size_of_block;
-		return new_addr + sizeof(size_t);
+		*(uintptr_t **) ptr_to_list = new_addr + size_of_block;
+
+		return new_addr + sizeof(uintptr_t);
 	} else {
-		void *block = *(free_list + i);
-		*(free_list + i) = block + sizeof(size_t);
-		return block + sizeof(size_t);
+		void *block_addr = *(uintptr_t **) ptr_to_list;
+		*(uintptr_t **) ptr_to_list = *(uintptr_t **) (block_addr + sizeof(uintptr_t));	
+
+		return block_addr + sizeof(uintptr_t);
 	}
 }
 
@@ -135,8 +155,22 @@ void *malloc(size_t size) {
  * for this (see man 3 memset).
  */
 void *calloc(size_t nmemb, size_t size) {
-    void *ptr = bulk_alloc(nmemb * size);
-    memset(ptr, 0, nmemb * size);
+	if (nmemb <= 0 || size <= 0) {
+		return NULL;
+	}
+
+	size_t total_size = nmemb * size;
+
+	if (total_size <= 0) {
+		return NULL;
+	}
+
+    void *ptr = malloc(total_size);
+	if (ptr == NULL) {
+		return NULL;
+	}
+
+    memset(ptr, 0, total_size);
     return ptr;
 }
 
@@ -153,8 +187,34 @@ void *calloc(size_t nmemb, size_t size) {
  * implementation!
  */
 void *realloc(void *ptr, size_t size) {
-    fprintf(stderr, "Realloc is not implemented!\n");
-    return NULL;
+	if (ptr != NULL && size == 0) {
+		free(ptr);
+		return NULL;
+	}
+	
+	if (ptr == NULL && size == 0) {
+		return NULL;
+	}
+
+	if (ptr == NULL && size > 0) {
+		return malloc(size);
+	}
+	
+	size_t old_size = *(uintptr_t *) (ptr - sizeof(uintptr_t));
+	if (size <= old_size - sizeof(uintptr_t)) {
+		return ptr;
+	}
+
+	void *new_addr = malloc(size);
+	if (new_addr == NULL) {
+		return NULL;
+	}
+
+	for (int i = sizeof(uintptr_t); i < old_size; i++) {
+		*(char *) (new_addr + i) = *(char *) (ptr + i);
+	}
+
+	return new_addr;
 }
 
 /*
@@ -167,14 +227,18 @@ void *realloc(void *ptr, size_t size) {
 void free(void *ptr) {
 	if (ptr == NULL) { return; }
 
-	size_t size_of_block = *(size_t *) (ptr - sizeof(size_t));
+	void *ptr_to_block = ptr - sizeof(uintptr_t);
+	size_t size_of_block = *(uintptr_t *) ptr_to_block;
 
 	if (size_of_block > CHUNK_SIZE) {
-		bulk_free(ptr - sizeof(size_t), size_of_block);
+		bulk_free(ptr_to_block, size_of_block);
 	} else {
-		int i = size_of_block - __builtin_clz(size_of_block) - 1;				
+		int block_size = (int) size_of_block;
+		int i = 32 - __builtin_clz(block_size) - 1;				
 		if (free_list != NULL) {
-			*(intptr_t *) ptr = *(free_list + i);
+			void *free_list_addr = free_list + (i * sizeof(uintptr_t));
+			*(uintptr_t **) ptr = *(uintptr_t **) free_list_addr;
+			*(uintptr_t **) free_list_addr = ptr_to_block;
 		}
 	}
 }
