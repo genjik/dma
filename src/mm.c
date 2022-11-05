@@ -96,6 +96,7 @@ void *malloc(size_t size) {
 		}
 	}
 
+
 	// Use bulk_alloc for size > 4088
 	if (size > CHUNK_SIZE - sizeof(uintptr_t)) {
 		size_t total_size = size + sizeof(uintptr_t);
@@ -106,6 +107,8 @@ void *malloc(size_t size) {
 		}
 
 		*(uintptr_t *) addr = total_size;
+		
+		fprintf(stderr, "malloc req %ld address=%p\n", size, addr + sizeof(uintptr_t));
 		return addr + sizeof(uintptr_t);
 	}
 
@@ -125,8 +128,9 @@ void *malloc(size_t size) {
 			*(uintptr_t *) curr_addr = size_of_block;
 
 			void *adj_addr = curr_addr + sizeof(uintptr_t);
+
 			if (j == CHUNK_SIZE - size_of_block) {
-				*(uintptr_t *) adj_addr = 0;
+ 				*(uintptr_t **) adj_addr = NULL;
 			} else {
 				*(uintptr_t **) adj_addr = curr_addr + size_of_block;
 			}
@@ -134,11 +138,14 @@ void *malloc(size_t size) {
 
 		*(uintptr_t **) ptr_to_list = new_addr + size_of_block;
 
+		fprintf(stderr, "malloc req %ld address=%p\n", size, new_addr + sizeof(uintptr_t));
+
 		return new_addr + sizeof(uintptr_t);
 	} else {
 		void *block_addr = *(uintptr_t **) ptr_to_list;
 		*(uintptr_t **) ptr_to_list = *(uintptr_t **) (block_addr + sizeof(uintptr_t));	
 
+		fprintf(stderr, "malloc req %ld address=%p\n", size, block_addr + sizeof(uintptr_t));
 		return block_addr + sizeof(uintptr_t);
 	}
 }
@@ -192,13 +199,10 @@ void *realloc(void *ptr, size_t size) {
 		return NULL;
 	}
 	
-	if (ptr == NULL && size == 0) {
-		return NULL;
-	}
-
-	if (ptr == NULL && size > 0) {
+	if (ptr == NULL) { 
 		return malloc(size);
 	}
+
 	
 	size_t old_size = *(uintptr_t *) (ptr - sizeof(uintptr_t));
 	if (size <= old_size - sizeof(uintptr_t)) {
@@ -210,9 +214,13 @@ void *realloc(void *ptr, size_t size) {
 		return NULL;
 	}
 
-	for (int i = sizeof(uintptr_t); i < old_size; i++) {
-		*(char *) (new_addr + i) = *(char *) (ptr + i);
+	for (int i = 0; i < old_size - sizeof(uintptr_t); i++) {
+		*(char *) (new_addr + i) = *(char *) (ptr + i + sizeof(uintptr_t));
 	}
+
+	fprintf(stderr, "old_size: %ld, new_size: %ld requested: %ld ptr=%p\n", old_size, *(uintptr_t *) (new_addr - sizeof(uintptr_t)), size, ptr);
+	fprintf(stderr, "next ptr=%p\n", *(uintptr_t **) new_addr);
+	free(ptr);
 
 	return new_addr;
 }
