@@ -12,11 +12,10 @@ void free(void *ptr);
 void *calloc(size_t nmemb, size_t size);
 void *realloc(void *ptr, size_t size);
 
-void free_list_validator();
-
 /* When requesting memory from the OS using sbrk(), request it in
  * increments of CHUNK_SIZE. */
 #define CHUNK_SIZE (1<<12)
+#define DEBUG1
 
 /*
  * This function, defined in bulk.c, allocates a contiguous memory
@@ -59,10 +58,14 @@ static inline __attribute__((unused)) int block_index(size_t x) {
     }
 }
 
-// Initializes multi-pool allocator's free list.
-// Keep in mind that indexes [0, 4] inclusive should remain NULL at all time
-// For now, init requires using sbrk(CHUNK_SIZE=4096), but the data structure
-// only needs 104/4096 bytes. Any memory address after 103 should not be used.
+typedef struct Node {
+	uintptr_t size;
+	uintptr_t *next_addr;
+} Node;
+
+// [0-63] memory addresses are reserved for free_list data structure
+// [64-4095] will be splited into 63 blocks of size 64 bytes and added to
+// free_list
 static void *free_list = NULL;
 
 static int init_heap() {
@@ -71,12 +74,57 @@ static int init_heap() {
 		return -1;
 	}
 
-	for (int i = 0; i < 512; i++) {
+	for (int i = 0; i < 8; i++) {
 		void *curr_addr = free_list + (i * sizeof(uintptr_t));
 		*(uintptr_t *) curr_addr = 0;
 	}
-	
+
+	void *offset = free_list + 64;
+	for (int i = 0; i < 63; i++) {
+		void *curr_addr = offset + (i * 64);
+
+		Node *curr_node = (Node *) curr_addr;
+		curr_node->size = 64;
+		if (i != 62) {
+			curr_node->next_addr = curr_addr + 64;
+		} else {
+			curr_node->next_addr = NULL;
+		}
+	}
+
+	*(uintptr_t **) (free_list + 8) = offset;
+
 	return 0;
+}
+
+void print_ds() {
+	#ifdef DEBUG
+	if (free_list == NULL) {
+		fprintf(stderr, "free_list is empty\n");
+		return;
+	}
+
+	for (int i = 0; i < 8; i++) {
+		void *curr_addr = free_list + (i * sizeof(uintptr_t));
+
+		fprintf(stderr, "\n%d) %p = ", i, curr_addr);
+
+		void *temp_addr = *(uintptr_t **) curr_addr;
+		Node *temp_node = (Node *) temp_addr;
+		int count = 0;
+		
+		if (temp_node == NULL) {
+			fprintf(stderr, "%p\n", temp_addr);
+		} else {
+			while (temp_node != NULL) {
+				fprintf(stderr, "%p=[size:%ld, next:%p] -> ", temp_node, temp_node->size, temp_node->next_addr);
+				temp_node = (Node *) temp_node->next_addr;
+				count++;
+			}
+			fprintf(stderr, " free blocks in the list: %d\n\n", count);
+		}
+	}
+	#endif
 }
 
 /*
@@ -84,69 +132,70 @@ static int init_heap() {
  * the multi-pool allocator described in the project handout.
  */
 void *malloc(size_t size) {
-	if (size <= 0) { 
-		return NULL; 
+	if (size == 0) {
+		return NULL;
 	}
 
-	// Check if free_list is initialized. If it isn't, initialize it.
+	// Check if heap is initialized
 	if (free_list == NULL) {
-		int error = init_heap();
-		if (error == -1) { 
-			return NULL; 
+		if (init_heap() == -1) {
+			return NULL;
 		}
+		//print_ds();
 	}
 
-
-	// Use bulk_alloc for size > 4088
 	if (size > CHUNK_SIZE - sizeof(uintptr_t)) {
 		size_t total_size = size + sizeof(uintptr_t);
-		void *addr = bulk_alloc(total_size);	
+		void *block_addr = bulk_alloc(total_size);
 
-		if (addr == NULL) { 
+		if (block_addr == NULL) { 
 			return NULL; 
 		}
+		((Node *) block_addr)->size = total_size;
 
-		*(uintptr_t *) addr = total_size;
-		
-		fprintf(stderr, "malloc req %ld address=%p\n", size, addr + sizeof(uintptr_t));
-		return addr + sizeof(uintptr_t);
+		return block_addr + sizeof(uintptr_t);
 	}
 
-	size_t i = block_index(size);
-	size_t offset = i * sizeof(uintptr_t);
-	void *ptr_to_list = free_list + offset;
+	// Subtracting 5 because heap data structure starts at index=0, not
+	// index=5
+	int i = block_index(size) - 5;
+	void *free_list_addr = free_list + (i * sizeof(uintptr_t));
 
-	if (*(uintptr_t **) ptr_to_list == NULL) {
-		void *new_addr = sbrk(CHUNK_SIZE);	
+	if (*(Node **) free_list_addr == NULL) {
+		void *new_addr = sbrk(CHUNK_SIZE);
+
 		if (new_addr == (void *) -1) {
 			return NULL;
 		}
 
-		size_t size_of_block = 1 << i;
-		for (int j = 0; j < CHUNK_SIZE; j += size_of_block) {
-			void *curr_addr = new_addr + j;
-			*(uintptr_t *) curr_addr = size_of_block;
+		size_t block_size = 1 << block_index(size);	
+		int list_size = CHUNK_SIZE / block_size;
 
-			void *adj_addr = curr_addr + sizeof(uintptr_t);
+		for (int j = 0; j < list_size; j++) {
+			void *curr_addr = new_addr + (j * block_size);
 
-			if (j == CHUNK_SIZE - size_of_block) {
- 				*(uintptr_t **) adj_addr = NULL;
+			((Node *) curr_addr)->size = block_size;
+
+			if (j == list_size - 1) {
+				((Node *) curr_addr)->next_addr = NULL;
 			} else {
-				*(uintptr_t **) adj_addr = curr_addr + size_of_block;
+				((Node *) curr_addr)->next_addr = curr_addr + block_size;
 			}
 		}
 
-		*(uintptr_t **) ptr_to_list = new_addr + size_of_block;
-
-		fprintf(stderr, "malloc req %ld address=%p\n", size, new_addr + sizeof(uintptr_t));
+		*(Node **) free_list_addr = (Node *) ((Node *) new_addr)->next_addr;
 
 		return new_addr + sizeof(uintptr_t);
 	} else {
-		void *block_addr = *(uintptr_t **) ptr_to_list;
-		*(uintptr_t **) ptr_to_list = *(uintptr_t **) (block_addr + sizeof(uintptr_t));	
+		Node *return_node = *(Node **) free_list_addr;	
+		Node *next_node = (Node *) return_node->next_addr;
 
-		fprintf(stderr, "malloc req %ld address=%p\n", size, block_addr + sizeof(uintptr_t));
-		return block_addr + sizeof(uintptr_t);
+		*(Node **) free_list_addr = next_node;
+
+		void *ret_addr = ((void *) return_node) + sizeof(uintptr_t);
+
+		print_ds();
+		return ret_addr;
 	}
 }
 
@@ -162,23 +211,24 @@ void *malloc(size_t size) {
  * for this (see man 3 memset).
  */
 void *calloc(size_t nmemb, size_t size) {
-	if (nmemb <= 0 || size <= 0) {
+	if (nmemb == 0 || size == 0) {
 		return NULL;
 	}
 
 	size_t total_size = nmemb * size;
 
-	if (total_size <= 0) {
-		return NULL;
+	// WARNING!!! DON'T FORGET TO IMPLEMENT THIS LATER
+	// calloc requirement: catching integer overflow on multiplication
+	// of nmemb * size
+
+	void *ret_addr = malloc(total_size);
+	if (ret_addr == NULL) {
+		return ret_addr;
 	}
 
-    void *ptr = malloc(total_size);
-	if (ptr == NULL) {
-		return NULL;
-	}
-
-    memset(ptr, 0, total_size);
-    return ptr;
+	memset(ret_addr, 0, total_size);
+	
+	return ret_addr;
 }
 
 /*
@@ -198,16 +248,17 @@ void *realloc(void *ptr, size_t size) {
 		free(ptr);
 		return NULL;
 	}
-	
-	if (ptr == NULL) { 
+	if (ptr == NULL) {
 		return malloc(size);
 	}
 
+	uintptr_t old_size = *(uintptr_t *) (ptr - sizeof(uintptr_t));
 	
-	size_t old_size = *(uintptr_t *) (ptr - sizeof(uintptr_t));
 	if (size <= old_size - sizeof(uintptr_t)) {
 		return ptr;
 	}
+
+
 
 	void *new_addr = malloc(size);
 	if (new_addr == NULL) {
@@ -215,11 +266,9 @@ void *realloc(void *ptr, size_t size) {
 	}
 
 	for (int i = 0; i < old_size - sizeof(uintptr_t); i++) {
-		*(char *) (new_addr + i) = *(char *) (ptr + i + sizeof(uintptr_t));
+		*(char *) (new_addr + i) = *(char *) (ptr + i);	
 	}
 
-	fprintf(stderr, "old_size: %ld, new_size: %ld requested: %ld ptr=%p\n", old_size, *(uintptr_t *) (new_addr - sizeof(uintptr_t)), size, ptr);
-	fprintf(stderr, "next ptr=%p\n", *(uintptr_t **) new_addr);
 	free(ptr);
 
 	return new_addr;
@@ -233,20 +282,30 @@ void *realloc(void *ptr, size_t size) {
  * The given implementation does nothing.
  */
 void free(void *ptr) {
-	if (ptr == NULL) { return; }
-
-	void *ptr_to_block = ptr - sizeof(uintptr_t);
-	size_t size_of_block = *(uintptr_t *) ptr_to_block;
-
-	if (size_of_block > CHUNK_SIZE) {
-		bulk_free(ptr_to_block, size_of_block);
-	} else {
-		int block_size = (int) size_of_block;
-		int i = 32 - __builtin_clz(block_size) - 1;				
-		if (free_list != NULL) {
-			void *free_list_addr = free_list + (i * sizeof(uintptr_t));
-			*(uintptr_t **) ptr = *(uintptr_t **) free_list_addr;
-			*(uintptr_t **) free_list_addr = ptr_to_block;
-		}
+	if (ptr == NULL) {
+		return;
 	}
+
+	void *block_addr = ptr - sizeof(uintptr_t);
+	size_t block_size = *(uintptr_t *) block_addr;
+
+	if (block_size > CHUNK_SIZE) {
+		bulk_free(block_addr, block_size);
+		return;
+	}
+
+	if (free_list == NULL) {
+		return;
+	}
+
+	int i = 32 - __builtin_clz((int) block_size) - 6;
+	
+	void *free_list_addr = free_list + (i * sizeof(uintptr_t));
+	Node *prev_head = *(Node **) free_list_addr;
+
+	Node *freeing_block = (Node *) block_addr;
+	freeing_block->next_addr = (uintptr_t *) prev_head;
+
+	*(Node **) free_list_addr = freeing_block;
+	print_ds();
 }
